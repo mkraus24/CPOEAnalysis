@@ -1,0 +1,408 @@
+---
+title: "CPOE Analysis"
+author: "Matthew Kraus"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r Libraries}
+library(tidyverse)
+library(tidymodels)
+library(data.table)
+library(nflverse)
+library(vip)
+library(gt)
+library(gtExtras)
+
+Sys.setenv(CHROMOTE_CHROME = "C:/Users/15622/AppData/Local/Google/Chrome/Application/chrome.exe")
+```
+
+```{r Data Import}
+clear_cache()
+playbyplay <- data.table(load_pbp(seasons = 2006:2023))
+players <- data.table(load_players())
+games <- data.table(load_sharpe_games())
+rosters <- data.table(load_rosters(seasons = 2006:2023))
+
+drop <- rbind(data.table(read_csv("CPOE/WR_Drop.csv", show_col_types = F)),
+              data.table(read_csv("CPOE/TE_Drop.csv", show_col_types = F)))
+```
+
+```{r Clean Data}
+playbyplay1 <- playbyplay[, c("play_id", "game_id", "week", "yardline_100", "season_type", "quarter_seconds_remaining", "half_seconds_remaining", "game_seconds_remaining", "game_half", "qtr", "down", "ydstogo", "ydsnet", "yards_gained", "shotgun", "no_huddle", "air_yards", "qb_hit", "complete_pass", "pass_location", "posteam_timeouts_remaining", "defteam_timeouts_remaining", "score_differential", "location", "temp", "wind", "passer_id", "pass", "special_teams_play", "posteam", "defteam", "posteam_type", "cp")]
+
+passonly <- playbyplay1[pass == 1 & special_teams_play == 0 & !is.na(air_yards)]
+
+passonly1 <- left_join(passonly, games %>% select(game_id, roof), by = "game_id") %>% relocate(roof, .after = wind)
+
+passonly2 <- passonly1[!(is.na(wind) & !(roof %in% c("dome", "closed")))]
+
+passonly3 <- left_join(passonly2, players %>% select(gsis_id, display_name, position), by = c("passer_id" = "gsis_id"))
+
+passonly4 <- passonly3[position == "QB"]
+
+passonly4 <- passonly4 %>% mutate(season := as.numeric(substr(game_id, 1, 4))) %>% relocate(season, .before = week)
+
+passonly4[, pass_outside := ifelse(pass_location != "middle", 1, 0)]
+
+passonly4[, posteam_home := ifelse(posteam_type == "home", 1, 0)]
+
+passonly4[, era := ifelse(season %in% 2006:2011, "2006-2011",
+                          ifelse(season %in% 2012:2017, "2012-2017", "2018-2023"))]
+
+passonly4[, dist_to1stdown := air_yards - ydstogo]
+
+passonly4[, complete_pass := as.factor(complete_pass)]
+
+drop <- drop %>% select(-Rank)
+
+drop[, Team := gsub("([()])","", Player)]
+
+drop[, Team := word(Team, -1)]
+
+drop[, Player := gsub(paste(c("[(]", "[)]"), collapse = "|"), "", Player)]
+
+drop[, Player := gsub("\\s*\\w*$", "", Player)]
+
+drop <- drop %>% relocate(Team, .after = Player)
+
+drop[, Team := ifelse(Player == "Marvin Jones Jr.", "DET",
+                      ifelse(Player == "Zach Ertz", "ARI", Team))]
+
+drop_pct <- data.table(drop %>% group_by(Team) %>% summarise(Drop_Pct = DROP / TGT) %>% group_by(Team) %>% summarise(Drop_Pct = mean(Drop_Pct))) %>% mutate(Team = ifelse(Team == "JAC", "JAX", ifelse(Team == "LAR", "LA", Team)))
+
+rm(passonly, passonly1, passonly2, passonly3, playbyplay)
+```
+
+```{r Indoor Model Data / Split / KFold}
+indoor_modeldata <- passonly4[roof %in% c("dome", "closed"), c("season", "week", "display_name", "passer_id", "complete_pass", "yardline_100", "half_seconds_remaining", "game_seconds_remaining", "down", "ydstogo", "air_yards", "dist_to1stdown", "qb_hit", "pass_outside", "posteam_home", "era", "cp")]
+
+set.seed(123)
+train_indoor <- indoor_modeldata[season %in% sample(2006:2023, 12, replace = F)]
+test_indoor <- indoor_modeldata[!(season %in% train_indoor$season)]
+
+recipe_indoor <- recipe(complete_pass ~ yardline_100 + half_seconds_remaining + game_seconds_remaining + down + ydstogo + air_yards + dist_to1stdown + qb_hit + pass_outside + posteam_home + era, data = train_indoor) %>% step_dummy(all_nominal_predictors())
+
+kfold_indoor <- vfold_cv(train_indoor, v = 5, strata = complete_pass)
+```
+
+```{r Indoor Model}
+set.seed(123)
+xgb_model_indoor <- boost_tree(trees = 1000,
+                        tree_depth = 3,
+                        min_n = 15,
+                        loss_reduction = 0.000001933805,
+                        sample_size = 0.4963083,
+                        mtry = 6,
+                        learn_rate = 0.01930096) %>% 
+                        set_engine("xgboost") %>% 
+                        set_mode("classification")
+
+# xgb_grid_indoor <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), train_indoor),
+#   learn_rate(),
+#   size = 5)
+
+xgb_wf_indoor <- workflow() %>%
+   add_model(xgb_model_indoor) %>%
+   add_recipe(recipe_indoor)
+
+# set.seed(123)
+# xgb_tune_indoor <- tune_grid(
+#   xgb_wf_indoor,
+#   resamples = kfold_indoor,
+#   grid = xgb_grid_indoor,
+#   control = control_grid(save_pred = TRUE)
+# )
+
+# collect_metrics(xgb_tune_indoor)
+#  
+# xgb_best_indoor <- select_best(xgb_tune_indoor, "roc_auc")
+# 
+# xgb_final_indoor <- finalize_workflow(
+#  xgb_wf_indoor,
+#  xgb_best_indoor)
+
+set.seed(123)
+xgb_final_fit_indoor <- xgb_wf_indoor %>%
+   fit(data = train_indoor)
+
+xgb_pred_indoor <- data.table(xgb_final_fit_indoor %>% predict(train_indoor, type = "prob") %>% bind_cols(train_indoor))
+
+xgb_predtest_indoor <- data.table(xgb_final_fit_indoor %>% predict(test_indoor, type = "prob") %>% bind_cols(test_indoor))
+
+# xgb_pred_indoor %>% accuracy(truth = complete_pass, estimate = .pred_class)
+
+# xgb_predtest_indoor %>% accuracy(truth = complete_pass, estimate = .pred_class)
+
+vipplot_indoor <- xgb_final_fit_indoor %>% extract_fit_parsnip() %>% vip(20)
+vipplot_indoor
+
+# ggsave(filename = "vipplot_indoor.png", plot = vipplot_indoor)
+```
+
+```{r Outdoor Model Data / Split / KFold}
+outdoor_modeldata <- passonly4[roof == "outdoors", c("season", "week", "display_name", "passer_id", "complete_pass", "yardline_100", "half_seconds_remaining", "game_seconds_remaining", "down", "ydstogo", "air_yards", "dist_to1stdown", "qb_hit", "pass_outside", "posteam_home", "temp", "wind", "era", "cp")]
+
+set.seed(123)
+train_outdoor <- outdoor_modeldata[season %in% sample(2006:2023, 12, replace = F)]
+test_outdoor <- outdoor_modeldata[!(season %in% train_outdoor$season)]
+
+recipe_outdoor <- recipe(complete_pass ~ yardline_100 + half_seconds_remaining + game_seconds_remaining + down + ydstogo + air_yards + dist_to1stdown + qb_hit + pass_outside + posteam_home + era + temp + wind, data = train_outdoor) %>% step_dummy(all_nominal_predictors())
+
+kfold_outdoor <- vfold_cv(train_outdoor, v = 5, strata = complete_pass)
+```
+
+```{r Outdoor Model}
+set.seed(123)
+xgb_model_outdoor <- boost_tree(trees = 1000,
+                        tree_depth = 3,
+                        min_n = 15,
+                        loss_reduction = 0.00000193805,
+                        sample_size = 0.4963083,
+                        mtry = 8,
+                        learn_rate = 0.01930096) %>% 
+                        set_engine("xgboost") %>% 
+                        set_mode("classification")
+
+# xgb_grid_outdoor <- grid_latin_hypercube(
+#   tree_depth(),
+#   min_n(),
+#   loss_reduction(),
+#   sample_size = sample_prop(),
+#   finalize(mtry(), train_outdoor),
+#   learn_rate(),
+#   size = 5)
+
+xgb_wf_outdoor <- workflow() %>%
+   add_model(xgb_model_outdoor) %>%
+   add_recipe(recipe_outdoor)
+
+# set.seed(123)
+# xgb_tune_outdoor <- tune_grid(
+#   xgb_wf_outdoor,
+#   resamples = kfold_outdoor,
+#   grid = xgb_grid_outdoor,
+#   control = control_grid(save_pred = TRUE)
+# )
+# 
+# collect_metrics(xgb_tune_outdoor)
+# 
+# xgb_best_outdoor <- select_best(xgb_tune_outdoor, "roc_auc")
+# 
+# xgb_final_outdoor <- finalize_workflow(
+#  xgb_wf_outdoor,
+#  xgb_best_outdoor)
+
+set.seed(123)
+xgb_final_fit_outdoor <- xgb_wf_outdoor %>%
+   fit(data = train_outdoor)
+
+xgb_pred_outdoor <- data.table(xgb_final_fit_outdoor %>% predict(train_outdoor, type = "prob") %>% bind_cols(train_outdoor))
+
+xgb_predtest_outdoor <- data.table(xgb_final_fit_outdoor %>% predict(test_outdoor, type = "prob") %>% bind_cols(test_outdoor))
+
+# xgb_pred_outdoor %>% accuracy(truth = complete_pass, estimate = .pred_class)
+
+# xgb_predtest_outdoor %>% accuracy(truth = complete_pass, estimate = .pred_class)
+
+vipplot_outdoor <- xgb_final_fit_outdoor %>% extract_fit_parsnip() %>% vip(20)
+vipplot_outdoor
+
+# ggsave(filename = "vipplot_outdoor.png", plot = vipplot_outdoor)
+```
+
+```{r Full / 2023 Results}
+fullresults <- rbind(xgb_pred_indoor, xgb_predtest_indoor, xgb_pred_outdoor, xgb_predtest_outdoor, fill = T) %>% mutate(temp = ifelse(is.na(temp), 999, temp), wind = ifelse(is.na(wind), 0, wind)) %>% rename(nflverse_cp = cp, cp = .pred_1)
+finalresults <- fullresults[, c("complete_pass", "cp", "nflverse_cp", "era", "season", "display_name", "passer_id", "yardline_100", "half_seconds_remaining", "game_seconds_remaining", "down", "ydstogo", "air_yards", "dist_to1stdown", "qb_hit", "pass_outside", "posteam_home", "temp", "wind")]
+
+results2023 <- finalresults[season == 2023]
+```
+
+```{r New Model vs. nflverse Data}
+plotdata <- left_join(finalresults, rosters[, c("gsis_id", "season", "team")], by = c("passer_id" = "gsis_id", "season" = "season"))
+
+plotdata[, team := ifelse(team == "ARZ", "ARI",
+                          ifelse(team == "BLT", "BAL",
+                                 ifelse(team == "CLV", "CLE",
+                                        ifelse(team == "HST", "HOU",
+                                               ifelse(team == "SL", "STL", team)))))]
+```
+
+```{r New Model vs. nflverse}
+newvsnflverse <- ggplot(plotdata[season == 2023 & !is.na(nflverse_cp)], aes(x = cp, y = nflverse_cp, color = passer_id)) +
+  geom_point(show.legend = F, aes(color = team, fill = team), size = 2, alpha = 0.75) +
+  geom_smooth(method = "lm", color = "grey", alpha = 0.1, se = F) +
+  scale_color_nfl(type = "primary") +
+  scale_fill_nfl(alpha = 0.65) +
+  ggtitle("Completion Probability (CP) from Created Model vs. nflverse CP - 2023 Season") +
+  xlab("Completion Probability from Created Model") +
+  ylab("nflverse Completion Probability") +
+  labs(caption = "Correlation: 98.7%") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5))
+
+# ggsave(filename = "modelvsnflverse.png", plot = newvsnflverse)
+```
+
+```{r Table Data}
+cmp_pct <- data.table(results2023 %>% group_by(display_name, passer_id) %>% summarise(PassAtt = n(), Cmp_Pct = sum(complete_pass == 1) / PassAtt) %>% select(display_name, passer_id, Cmp_Pct, PassAtt))
+
+avg_cp <- data.table(results2023 %>% group_by(display_name, passer_id) %>% summarise(AvgCP = mean(cp)))
+
+tabledata <- left_join(cmp_pct, avg_cp) %>% relocate(PassAtt, .after = AvgCP) %>% mutate(CPOE = Cmp_Pct - AvgCP) %>% relocate(PassAtt, .after = CPOE)
+
+tabledata <- left_join(tabledata, rosters[season == 2023, c("gsis_id", "team")], by = c("passer_id" = "gsis_id")) %>% relocate(team, .after = display_name)
+
+tabledata <- left_join(tabledata, drop_pct, by = c("team" = "Team"))
+
+tabledata <- tabledata %>% mutate(Cmp_Pct = round(Cmp_Pct*100, 1), AvgCP = round(AvgCP*100, 1), CPOE = round(CPOE*100, 1), Drop_Pct = round(Drop_Pct*100, 1))
+
+deep_cmp_pct <- data.table(results2023 %>% filter(air_yards >= 20) %>% group_by(display_name, passer_id) %>% summarise(PassAtt = n(), Cmp_Pct = sum(complete_pass == 1) / PassAtt) %>% select(display_name, passer_id, Cmp_Pct, PassAtt))
+
+deep_avg_cp <- data.table(results2023 %>% filter(air_yards >= 20) %>% group_by(display_name, passer_id) %>% summarise(AvgCP = mean(cp)))
+
+deep_tabledata <- left_join(deep_cmp_pct, deep_avg_cp) %>% relocate(PassAtt, .after = AvgCP) %>% mutate(CPOE = Cmp_Pct - AvgCP) %>% relocate(PassAtt, .after = CPOE)
+
+deep_tabledata <- left_join(deep_tabledata, rosters[season == 2023, c("gsis_id", "team")], by = c("passer_id" = "gsis_id")) %>% relocate(team, .after = display_name)
+
+deep_tabledata <- left_join(deep_tabledata, drop_pct, by = c("team" = "Team"))
+
+deep_tabledata <- deep_tabledata %>% mutate(Cmp_Pct = round(Cmp_Pct*100, 1), AvgCP = round(AvgCP*100, 1), CPOE = round(CPOE*100, 1), Drop_Pct = round(Drop_Pct*100, 1)) %>% rename(DeepPassAtt = PassAtt, DeepCPOE = CPOE)
+
+deep_tabledata <- left_join(deep_tabledata, tabledata %>% select(passer_id, CPOE, PassAtt), by = "passer_id")
+```
+
+```{r Visualizations}
+top10cpoe <- 
+  tabledata %>%
+  filter(PassAtt >= 100) %>% 
+  select(passer_id, display_name, CPOE, Drop_Pct) %>% 
+  arrange(desc(CPOE)) %>% 
+  head(10) %>% 
+  gt() %>%
+  gt_theme_538() %>% 
+  tab_header(title = "Top 10 QBs in 2023 - CPOE",
+             subtitle = "min. 100 pass attempts") %>% 
+  gt_nfl_headshots(columns = passer_id, height = 40) %>%
+  cols_label(passer_id = "",
+             display_name = "Player",
+             CPOE = "CPOE (%)",
+             Drop_Pct = "Drop %") %>% 
+  tab_style(locations = cells_body(columns = CPOE),
+            style = cell_text(color = "white")
+            ) %>%
+  data_color(columns = CPOE,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#9ACD32", "#008E00"),
+               domain = c(1.7, 8.5)
+               )
+             ) %>% 
+   # data_color(columns = Drop_Pct,
+   #           autocolor_text = T,
+   #           fn = scales::col_numeric(
+   #             palette = "YlOrRd",
+   #             domain = c(1, 10)
+   #             )
+   #           ) %>%
+  opt_align_table_header(align = "center")
+
+bottom10cpoe <- 
+  tabledata %>%
+  filter(PassAtt >= 100) %>% 
+  select(passer_id, display_name, CPOE, Drop_Pct) %>% 
+  arrange(CPOE) %>% 
+  head(10) %>% 
+  gt() %>%
+  gt_theme_538() %>% 
+  tab_header(title = "Worst QBs in 2023 - CPOE",
+             subtitle = "min. 100 attempts") %>%
+  gt_nfl_headshots(columns = passer_id, height = 40) %>%
+  cols_label(passer_id = " ",
+             display_name = "Player",
+             CPOE = "CPOE (%)",
+             Drop_Pct = "Drop %") %>% 
+  tab_style(locations = cells_body(columns = CPOE),
+            style = cell_text(color = "white")
+            ) %>% 
+  data_color(columns = CPOE,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#FF0000", "#FFF000"),
+               domain = c(-12.2, 5)
+               )
+             ) %>% 
+  # data_color(columns = Drop_Pct,
+  #            autocolor_text = F,
+  #            fn = scales::col_numeric(
+  #              palette = c("#FFF000", "#FF0000"),
+  #              domain = c(2, 6.8)
+  #              )
+  #            ) %>%
+  opt_align_table_header(align = "center")
+  
+# deeppasses <-   
+  deep_tabledata %>%
+  filter(DeepPassAtt >= 25) %>% 
+  mutate(DeepPassPct = round((DeepPassAtt / PassAtt)*100, 1)) %>% 
+  select(passer_id, display_name, CPOE, DeepPassPct) %>% 
+  arrange(desc(CPOE)) %>% 
+  head(10) %>% 
+  gt() %>%
+  gt_theme_538() %>% 
+  tab_header(title = "Best Deep Ball Passers of 2023 - CPOE",
+             subtitle = "min. 25 pass attempts of 20+ air yards") %>% 
+  gt_nfl_headshots(columns = passer_id, height = 40) %>%
+  cols_label(passer_id = " ",
+             display_name = "Player",
+             CPOE = "CPOE (%)",
+             DeepPassPct = "Deep Pass %") %>% 
+  tab_style(locations = cells_body(columns = CPOE),
+            style = cell_text(color = "white")
+            ) %>%
+  data_color(columns = CPOE,
+             autocolor_text = F,
+             fn = scales::col_numeric(
+               palette = c("#9ACD32", "#008E00"),
+               domain = c(3.7, 8.5)
+               )
+             ) %>% 
+   # data_color(columns = Drop_Pct,
+   #           autocolor_text = T,
+   #           fn = scales::col_numeric(
+   #             palette = "YlOrRd",
+   #             domain = c(1, 10)
+   #             )
+   #           ) %>%
+  opt_align_table_header(align = "center")
+  
+# gtsave(top10cpoe, filename = "top10cpoe.png")
+# gtsave(bottom10cpoe, filename = "bottom10cpoe.png")
+```
+
+```{r CPOE vs. Deep CPOE}
+cpoevsdeepcpoe <- deep_tabledata %>% filter(DeepPassAtt >= 25) %>% 
+  ggplot(aes(x = CPOE, y = DeepCPOE)) +
+  geom_nfl_headshots(aes(player_gsis = passer_id), width = 0.065) +
+  geom_smooth(method = "lm", color = "grey", alpha = 0.025, se = F) +
+  geom_mean_lines(aes(x0 = CPOE, y0 = DeepCPOE), alpha = 0.4) +
+  labs(title = "Total CPOE vs. CPOE on Deep Passes (20+ Air Yards)",
+       caption = "Correlation: 58.0%",
+       x = "Total CPOE",
+       y = "CPOE on Deep Passes") +
+  theme_minimal() +
+  theme(plot.title = element_text(hjust = 0.5),
+        panel.grid.major = element_blank())
+
+# ggsave("cpoevsdeepcpoe.png", plot = cpoevsdeepcpoe)
+```
+
